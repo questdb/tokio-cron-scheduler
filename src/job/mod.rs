@@ -3,7 +3,7 @@ use crate::job::job_data::{JobState, JobType};
 #[cfg(feature = "has_bytes")]
 use crate::job::job_data_prost::{JobState, JobType};
 use crate::job_scheduler::JobsSchedulerLocked;
-use crate::{JobScheduler, JobSchedulerError, JobStoredData};
+use crate::{JobScheduler, JobSchedulerError, JobStoredData, SecondsMode};
 use chrono::{DateTime, Offset, TimeZone, Utc};
 use cron_job::CronJob;
 use croner::Cron;
@@ -88,6 +88,9 @@ pub trait Job {
 impl JobLocked {
     /// Create a new cron job.
     ///
+    /// This requires a 6-field cron expression with seconds (e.g., `"0 30 9 * * *"`).
+    /// To also allow parsing 5-field expressions without seconds, use [`Job::new_with_opt_seconds`].
+    ///
     /// ```rust,ignore
     /// let mut sched = JobScheduler::new();
     /// // Run at second 0 of the 15th minute of the 6th, 8th, and 10th hour
@@ -107,13 +110,36 @@ impl JobLocked {
         Self::new_tz(schedule, Utc, run)
     }
 
+    /// Create a new cron job that accepts both 5-field and 6-field cron expressions.
+    ///
+    /// ```rust,ignore
+    /// let mut sched = JobScheduler::new();
+    /// // Run every 5 minutes using standard crontab format (5-field)
+    /// let job = Job::new_with_opt_seconds("*/5 * * * *", |_uuid, _lock| {
+    ///             println!("{:?} Hi I ran", chrono::Utc::now());
+    ///         });
+    /// sched.add(job)
+    /// tokio::spawn(sched.start());
+    /// ```
+    pub fn new_with_opt_seconds<S, T>(schedule: S, run: T) -> Result<Self, JobSchedulerError>
+    where
+        T: 'static,
+        T: FnMut(Uuid, JobsSchedulerLocked) + Send + Sync,
+        S: ToString,
+    {
+        Self::new_tz_with_opt_seconds(schedule, Utc, run)
+    }
+
     /// Create a new cron job at a timezone.
+    ///
+    /// This requires a 6-field cron expression with seconds (e.g., `"0 30 9 * * *"`).
+    /// To also allow parsing 5-field expressions without seconds, use [`Job::new_tz_with_opt_seconds`].
     ///
     /// ```rust,ignore
     /// let mut sched = JobScheduler::new();
     /// // Run at second 0 of the 15th minute of the 6th, 8th, and 10th hour
     /// // of any day in March and June that is a Friday of the year 2017.
-    /// let job = Job::new("0 15 6,8,10 * Mar,Jun Fri 2017", |_uuid, _lock| {
+    /// let job = Job::new_tz("0 15 6,8,10 * Mar,Jun Fri 2017", Utc, |_uuid, _lock| {
     ///             println!("{:?} Hi I ran", chrono::Utc::now());
     ///         });
     /// sched.add(job)
@@ -126,13 +152,54 @@ impl JobLocked {
         S: ToString,
         TZ: TimeZone,
     {
-        let schedule = Self::schedule_to_cron(schedule)?;
+        Self::new_tz_with_seconds_mode(schedule, timezone, SecondsMode::Required, run)
+    }
+
+    /// Create a new cron job at a timezone that accepts both 5-field and 6-field cron expressions.
+    ///
+    /// ```rust,ignore
+    /// let mut sched = JobScheduler::new();
+    /// // Run at the 15th minute of the 6th, 8th, and 10th hour (5-field crontab format)
+    /// let job = Job::new_tz_with_opt_seconds("15 6,8,10 * * *", Utc, |_uuid, _lock| {
+    ///             println!("{:?} Hi I ran", chrono::Utc::now());
+    ///         });
+    /// sched.add(job)
+    /// tokio::spawn(sched.start());
+    /// ```
+    pub fn new_tz_with_opt_seconds<S, T, TZ>(
+        schedule: S,
+        timezone: TZ,
+        run: T,
+    ) -> Result<Self, JobSchedulerError>
+    where
+        T: 'static,
+        T: FnMut(Uuid, JobsSchedulerLocked) + Send + Sync,
+        S: ToString,
+        TZ: TimeZone,
+    {
+        Self::new_tz_with_seconds_mode(schedule, timezone, SecondsMode::Optional, run)
+    }
+
+    fn new_tz_with_seconds_mode<S, T, TZ>(
+        schedule: S,
+        timezone: TZ,
+        seconds_mode: SecondsMode,
+        run: T,
+    ) -> Result<Self, JobSchedulerError>
+    where
+        T: 'static,
+        T: FnMut(Uuid, JobsSchedulerLocked) + Send + Sync,
+        S: ToString,
+        TZ: TimeZone,
+    {
+        let seconds: croner::parser::Seconds = seconds_mode.into();
+        let schedule = Self::schedule_to_cron_with_seconds_mode(schedule, seconds)?;
         let time_offset_seconds = timezone
             .offset_from_utc_datetime(&Utc::now().naive_local())
             .fix()
             .local_minus_utc();
         let schedule = CronParser::builder()
-            .seconds(croner::parser::Seconds::Required)
+            .seconds(seconds)
             .dom_and_dow(true)
             .build()
             .parse(&schedule)
@@ -172,6 +239,9 @@ impl JobLocked {
 
     /// Create a new async cron job.
     ///
+    /// This requires a 6-field cron expression with seconds (e.g., `"0 30 9 * * *"`).
+    /// To also allow parsing 5-field expressions without seconds, use [`Job::new_async_with_opt_seconds`].
+    ///
     /// ```rust,ignore
     /// let mut sched = JobScheduler::new();
     /// // Run at second 0 of the 15th minute of the 6th, 8th, and 10th hour
@@ -193,7 +263,32 @@ impl JobLocked {
         Self::new_async_tz(schedule, Utc, run)
     }
 
+    /// Create a new async cron job that accepts both 5-field and 6-field cron expressions.
+    ///
+    /// ```rust,ignore
+    /// let mut sched = JobScheduler::new();
+    /// // Run every 5 minutes using standard crontab format (5-field)
+    /// let job = Job::new_async_with_opt_seconds("*/5 * * * *", |_uuid, _lock| Box::pin( async move {
+    ///             println!("{:?} Hi I ran", chrono::Utc::now());
+    ///         }));
+    /// sched.add(job)
+    /// tokio::spawn(sched.start());
+    /// ```
+    pub fn new_async_with_opt_seconds<S, T>(schedule: S, run: T) -> Result<Self, JobSchedulerError>
+    where
+        T: 'static,
+        T: FnMut(Uuid, JobsSchedulerLocked) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync,
+        S: ToString,
+    {
+        Self::new_async_tz_with_opt_seconds(schedule, Utc, run)
+    }
+
     /// Create a new async cron job at a timezone.
+    ///
+    /// This requires a 6-field cron expression with seconds (e.g., `"0 30 9 * * *"`).
+    /// To also allow parsing 5-field expressions without seconds, use [`Job::new_async_tz_with_opt_seconds`].
     ///
     /// ```rust,ignore
     /// let mut sched = JobScheduler::new();
@@ -218,13 +313,58 @@ impl JobLocked {
         S: ToString,
         TZ: TimeZone,
     {
-        let schedule = Self::schedule_to_cron(schedule)?;
+        Self::new_async_tz_with_seconds_mode(schedule, timezone, SecondsMode::Required, run)
+    }
+
+    /// Create a new async cron job at a timezone that accepts both 5-field and 6-field cron expressions.
+    ///
+    /// ```rust,ignore
+    /// let mut sched = JobScheduler::new();
+    /// // Run at the 15th minute of the 6th, 8th, and 10th hour (5-field crontab format)
+    /// let job = Job::new_async_tz_with_opt_seconds("15 6,8,10 * * *", Utc, |_uuid, _lock| Box::pin( async move {
+    ///             println!("{:?} Hi I ran", chrono::Utc::now());
+    ///         }));
+    /// sched.add(job)
+    /// tokio::spawn(sched.start());
+    /// ```
+    pub fn new_async_tz_with_opt_seconds<S, T, TZ>(
+        schedule: S,
+        timezone: TZ,
+        run: T,
+    ) -> Result<Self, JobSchedulerError>
+    where
+        T: 'static,
+        T: FnMut(Uuid, JobsSchedulerLocked) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync,
+        S: ToString,
+        TZ: TimeZone,
+    {
+        Self::new_async_tz_with_seconds_mode(schedule, timezone, SecondsMode::Optional, run)
+    }
+
+    fn new_async_tz_with_seconds_mode<S, T, TZ>(
+        schedule: S,
+        timezone: TZ,
+        seconds_mode: SecondsMode,
+        run: T,
+    ) -> Result<Self, JobSchedulerError>
+    where
+        T: 'static,
+        T: FnMut(Uuid, JobsSchedulerLocked) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync,
+        S: ToString,
+        TZ: TimeZone,
+    {
+        let seconds: croner::parser::Seconds = seconds_mode.into();
+        let schedule = Self::schedule_to_cron_with_seconds_mode(schedule, seconds)?;
         let time_offset_seconds = timezone
             .offset_from_utc_datetime(&Utc::now().naive_local())
             .fix()
             .local_minus_utc();
         let schedule = CronParser::builder()
-            .seconds(croner::parser::Seconds::Required)
+            .seconds(seconds)
             .dom_and_dow(true)
             .build()
             .parse(&schedule)
@@ -889,11 +1029,27 @@ impl JobLocked {
         Ok(schedule.to_string())
     }
 
+    #[cfg(not(feature = "english"))]
+    pub(crate) fn schedule_to_cron_with_seconds_mode<T: ToString>(
+        schedule: T,
+        _seconds: croner::parser::Seconds,
+    ) -> Result<String, JobSchedulerError> {
+        Ok(schedule.to_string())
+    }
+
     #[cfg(feature = "english")]
     pub fn schedule_to_cron<T: ToString>(schedule: T) -> Result<String, JobSchedulerError> {
+        Self::schedule_to_cron_with_seconds_mode(schedule, croner::parser::Seconds::Required)
+    }
+
+    #[cfg(feature = "english")]
+    pub(crate) fn schedule_to_cron_with_seconds_mode<T: ToString>(
+        schedule: T,
+        seconds: croner::parser::Seconds,
+    ) -> Result<String, JobSchedulerError> {
         let schedule = schedule.to_string();
         match CronParser::builder()
-            .seconds(croner::parser::Seconds::Required)
+            .seconds(seconds)
             .dom_and_dow(true)
             .build()
             .parse(&schedule)
@@ -1032,5 +1188,57 @@ mod test {
 
         // Should be the same UTC time
         assert_eq!(utc_next, shanghai_next);
+    }
+
+    #[tokio::test]
+    async fn test_new_async_tz_with_opt_seconds() {
+        let mut scheduler = JobScheduler::new().await.unwrap();
+
+        let job_id = scheduler
+            .add(
+                JobLocked::new_async_tz_with_opt_seconds(
+                    "30 9 * * *", // 5-field format, starting with minutes
+                    chrono_tz::Europe::Paris,
+                    |_uuid, _lock| Box::pin(async move {}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let next_tick = scheduler
+            .next_tick_for_job(job_id)
+            .await
+            .unwrap()
+            .expect("Should have next_tick");
+
+        let paris_time = next_tick.with_timezone(&chrono_tz::Europe::Paris);
+        assert_eq!(paris_time.hour(), 9);
+        assert_eq!(paris_time.minute(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_new_with_opt_seconds() {
+        let mut scheduler = JobScheduler::new().await.unwrap();
+
+        let job_id = scheduler
+            .add(
+                JobLocked::new_with_opt_seconds(
+                    "*/5 * * * *", // Every 5 minutes, standard crontab format
+                    |_uuid, _lock| {},
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let next_tick = scheduler
+            .next_tick_for_job(job_id)
+            .await
+            .unwrap()
+            .expect("Should have next_tick");
+
+        // Minute should be divisible by 5
+        assert_eq!(next_tick.minute() % 5, 0);
     }
 }

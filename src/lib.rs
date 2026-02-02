@@ -26,6 +26,29 @@ use crate::job::job_data_prost::ListOfUuids;
 use chrono::{DateTime, Utc};
 use croner::Cron;
 use croner::parser::CronParser;
+
+/// Configure how the seconds field is handled in cron expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SecondsMode {
+    /// 6-field expressions required (e.g., "0 */5 * * * *").
+    /// This is the default for backward compatibility.
+    #[default]
+    Required,
+    /// 5 or 6 field expressions accepted (e.g., "*/5 * * * *" or "0 */5 * * * *").
+    Optional,
+    /// Only 5-field expressions accepted (e.g., "*/5 * * * *").
+    Disallowed,
+}
+
+impl From<SecondsMode> for croner::parser::Seconds {
+    fn from(mode: SecondsMode) -> Self {
+        match mode {
+            SecondsMode::Required => croner::parser::Seconds::Required,
+            SecondsMode::Optional => croner::parser::Seconds::Optional,
+            SecondsMode::Disallowed => croner::parser::Seconds::Disallowed,
+        }
+    }
+}
 #[cfg(not(feature = "has_bytes"))]
 use job::job_data::{JobAndNextTick, JobStoredData, Uuid as JobUuid};
 #[cfg(feature = "has_bytes")]
@@ -123,7 +146,7 @@ impl JobStoredData {
             })
             .and_then(|s| {
                 CronParser::builder()
-                    .seconds(croner::parser::Seconds::Required)
+                    .seconds(croner::parser::Seconds::Optional)
                     .dom_and_dow(true)
                     .build()
                     .parse(s)

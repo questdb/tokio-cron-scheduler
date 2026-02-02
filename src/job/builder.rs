@@ -8,7 +8,7 @@ use crate::job::job_data_prost;
 #[cfg(feature = "has_bytes")]
 pub use crate::job::job_data_prost::{JobStoredData, JobType, Uuid};
 use crate::job::{JobLocked, nop, nop_async};
-use crate::{JobSchedulerError, JobToRun, JobToRunAsync};
+use crate::{JobSchedulerError, JobToRun, JobToRunAsync, SecondsMode};
 use chrono::{Offset, TimeZone, Utc};
 use core::time::Duration;
 use croner::Cron;
@@ -28,6 +28,7 @@ pub struct JobBuilder<T> {
     pub duration: Option<Duration>,
     pub repeating: Option<bool>,
     pub instant: Option<Instant>,
+    pub seconds_mode: SecondsMode,
 }
 
 impl JobBuilder<Utc> {
@@ -42,6 +43,7 @@ impl JobBuilder<Utc> {
             duration: None,
             repeating: None,
             instant: None,
+            seconds_mode: SecondsMode::Required,
         }
     }
 }
@@ -58,12 +60,25 @@ impl<T: TimeZone> JobBuilder<T> {
             duration: self.duration,
             repeating: self.repeating,
             instant: self.instant,
+            seconds_mode: self.seconds_mode,
         }
     }
 
     pub fn with_job_id(self, job_id: Uuid) -> Self {
         Self {
             job_id: Some(job_id),
+            ..self
+        }
+    }
+
+    /// Configure how the seconds field is handled in cron expressions.
+    ///
+    /// - `SecondsMode::Required` (default): 6-field expressions required (e.g., "0 */5 * * * *")
+    /// - `SecondsMode::Optional`: 5 or 6 field expressions accepted (e.g., "*/5 * * * *" or "0 */5 * * * *")
+    /// - `SecondsMode::Disallowed`: Only 5-field expressions accepted (e.g., "*/5 * * * *")
+    pub fn with_seconds_mode(self, seconds_mode: SecondsMode) -> Self {
+        Self {
+            seconds_mode,
             ..self
         }
     }
@@ -100,9 +115,10 @@ impl<T: TimeZone> JobBuilder<T> {
     where
         TS: ToString,
     {
-        let schedule = JobLocked::schedule_to_cron(schedule)?;
+        let seconds: croner::parser::Seconds = self.seconds_mode.into();
+        let schedule = JobLocked::schedule_to_cron_with_seconds_mode(schedule, seconds)?;
         let schedule = CronParser::builder()
-            .seconds(croner::parser::Seconds::Required)
+            .seconds(seconds)
             .build()
             .parse(&schedule)
             .map_err(|_| JobSchedulerError::ParseSchedule)?;
@@ -222,7 +238,7 @@ impl<T: TimeZone> JobBuilder<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::JobScheduler;
+    use crate::{JobScheduler, SecondsMode};
     use chrono::Timelike;
 
     #[tokio::test]
@@ -252,5 +268,116 @@ mod test {
         let paris_time = next_tick.with_timezone(&chrono_tz::Europe::Paris);
         assert_eq!(paris_time.hour(), 9);
         assert_eq!(paris_time.minute(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_five_field_cron_with_optional_seconds() {
+        // 5-field expression should work with SecondsMode::Optional
+        let mut scheduler = JobScheduler::new().await.unwrap();
+
+        let job_id = scheduler
+            .add(
+                JobBuilder::new()
+                    .with_cron_job_type()
+                    .with_seconds_mode(SecondsMode::Optional)
+                    .with_schedule("30 9 * * *") // 5-field: minute hour dom month dow
+                    .unwrap()
+                    .with_run_async(Box::new(|_uuid, _lock| Box::pin(async move {})))
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let next_tick = scheduler
+            .next_tick_for_job(job_id)
+            .await
+            .unwrap()
+            .expect("Should have next_tick");
+
+        // Should run at minute 30, hour 9
+        assert_eq!(next_tick.minute(), 30);
+        assert_eq!(next_tick.hour(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_five_field_cron_fails_with_required_seconds() {
+        // 5-field expression should fail with default SecondsMode::Required
+        let result = JobBuilder::new()
+            .with_cron_job_type()
+            .with_schedule("30 9 * * *"); // 5-field without setting Optional
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_six_field_cron_works_with_optional_seconds() {
+        // 6-field expression should still work with SecondsMode::Optional
+        let mut scheduler = JobScheduler::new().await.unwrap();
+
+        let job_id = scheduler
+            .add(
+                JobBuilder::new()
+                    .with_cron_job_type()
+                    .with_seconds_mode(SecondsMode::Optional)
+                    .with_schedule("0 30 9 * * *") // 6-field with seconds
+                    .unwrap()
+                    .with_run_async(Box::new(|_uuid, _lock| Box::pin(async move {})))
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let next_tick = scheduler
+            .next_tick_for_job(job_id)
+            .await
+            .unwrap()
+            .expect("Should have next_tick");
+
+        assert_eq!(next_tick.second(), 0);
+        assert_eq!(next_tick.minute(), 30);
+        assert_eq!(next_tick.hour(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_five_field_cron_works_with_disallowed_seconds() {
+        // 5-field expression should work with SecondsMode::Disallowed
+        let mut scheduler = JobScheduler::new().await.unwrap();
+
+        let job_id = scheduler
+            .add(
+                JobBuilder::new()
+                    .with_cron_job_type()
+                    .with_seconds_mode(SecondsMode::Disallowed)
+                    .with_schedule("30 9 * * *") // 5-field: minute hour dom month dow
+                    .unwrap()
+                    .with_run_async(Box::new(|_uuid, _lock| Box::pin(async move {})))
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let next_tick = scheduler
+            .next_tick_for_job(job_id)
+            .await
+            .unwrap()
+            .expect("Should have next_tick");
+
+        // Should run at minute 30, hour 9
+        assert_eq!(next_tick.minute(), 30);
+        assert_eq!(next_tick.hour(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_six_field_cron_fails_with_disallowed_seconds() {
+        // 6-field expression should fail with SecondsMode::Disallowed
+        let result = JobBuilder::new()
+            .with_cron_job_type()
+            .with_seconds_mode(SecondsMode::Disallowed)
+            .with_schedule("0 30 9 * * *"); // 6-field should be rejected
+
+        assert!(result.is_err());
     }
 }
